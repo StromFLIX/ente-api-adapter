@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 use crate::client::{EnteApiError, MuseumClient};
 use crate::config::Settings;
 use crate::crypto::{b64decode, decrypt_chacha, decrypt_file_stream, secretbox_open};
+use crate::faces::DetectedFace;
 
 pub const FILE_TYPE_IMAGE: i64 = 0;
 pub const FILE_TYPE_VIDEO: i64 = 1;
@@ -45,11 +46,31 @@ pub struct ImageFile {
     pub longitude: Option<f64>,
     pub file_hash: Option<String>,
     pub is_deleted: bool,
+    /// Detected faces (from Ente's separate "mldata" dataset), annotated with
+    /// the person each face belongs to. Empty if face data is disabled or absent.
+    pub faces: Vec<DetectedFace>,
+    /// Dimensions of the image the face boxes are relative to.
+    pub face_image_width: Option<i64>,
+    pub face_image_height: Option<i64>,
 }
 
 impl ImageFile {
     pub fn media_type(&self) -> &'static str {
         media_type_name(self.file_type)
+    }
+
+    /// Distinct names of people detected in this image, in stable order.
+    pub fn person_names(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut names = Vec::new();
+        for face in &self.faces {
+            if let Some(name) = &face.person_name {
+                if seen.insert(name.clone()) {
+                    names.push(name.clone());
+                }
+            }
+        }
+        names
     }
 
     pub fn as_json(&self, download_url: &str) -> Value {
@@ -68,8 +89,14 @@ impl ImageFile {
             // URL of the still-encrypted blob, so other apps can fetch it
             // straight from the storage backend (e.g. the S3 bucket).
             "downloadUrl": download_url,
-            // Face/ML data is not part of core file metadata in Ente.
-            "faces": [],
+            // Detected faces (with person names where known) from Ente's
+            // separately-derived "mldata" dataset.
+            "faces": self.faces.iter().map(DetectedFace::as_json).collect::<Vec<_>>(),
+            // Convenience: distinct named people present in this image.
+            "people": self.person_names(),
+            // Dimensions the face boxes are relative to.
+            "faceImageWidth": self.face_image_width,
+            "faceImageHeight": self.face_image_height,
         })
     }
 }
@@ -175,6 +202,9 @@ fn decrypt_file(raw: &Value, album: &Album) -> Option<ImageFile> {
             longitude: None,
             file_hash: None,
             is_deleted: true,
+            faces: Vec::new(),
+            face_image_width: None,
+            face_image_height: None,
         });
     }
 
@@ -239,6 +269,9 @@ fn decrypt_file(raw: &Value, album: &Album) -> Option<ImageFile> {
         longitude,
         file_hash: str_field(&metadata, "hash"),
         is_deleted: false,
+        faces: Vec::new(),
+        face_image_width: None,
+        face_image_height: None,
     })
 }
 
@@ -341,6 +374,9 @@ pub struct ImageFilter {
     pub min_lon: Option<f64>,
     pub max_lon: Option<f64>,
     pub filename: Option<String>,
+    pub has_faces: Option<bool>,
+    pub min_faces: Option<usize>,
+    pub person: Option<String>,
 }
 
 pub fn filter_images<'a>(
@@ -350,6 +386,7 @@ pub fn filter_images<'a>(
     let album_lc = f.album.as_ref().map(|s| s.to_lowercase());
     let media_lc = f.media_type.as_ref().map(|s| s.to_lowercase());
     let filename_lc = f.filename.as_ref().map(|s| s.to_lowercase());
+    let person_lc = f.person.as_ref().map(|s| s.to_lowercase());
 
     let mut result: Vec<&ImageFile> = files
         .values()
@@ -405,6 +442,26 @@ pub fn filter_images<'a>(
                 match &file.title {
                     Some(t) if t.to_lowercase().contains(fname) => {}
                     _ => return false,
+                }
+            }
+            if let Some(hf) = f.has_faces {
+                if !file.faces.is_empty() != hf {
+                    return false;
+                }
+            }
+            if let Some(mf) = f.min_faces {
+                if file.faces.len() < mf {
+                    return false;
+                }
+            }
+            if let Some(p) = &person_lc {
+                let matched = file.faces.iter().any(|fc| {
+                    fc.person_name
+                        .as_ref()
+                        .map_or(false, |n| n.to_lowercase().contains(p))
+                });
+                if !matched {
+                    return false;
                 }
             }
             true

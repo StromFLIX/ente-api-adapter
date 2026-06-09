@@ -4,6 +4,7 @@ mod account;
 mod client;
 mod config;
 mod crypto;
+mod faces;
 mod files;
 mod sessions;
 mod srp;
@@ -95,7 +96,7 @@ impl Modify for SecurityAddon {
             with your Ente credentials to receive a bearer token, then list, fetch \
             (decrypted) and delete images."
     ),
-    paths(health, auth, auth_two_factor, logout, list_images, get_image, delete_image),
+    paths(health, auth, auth_two_factor, logout, list_images, list_people, get_image, delete_image),
     components(schemas(
         AuthRequest,
         TwoFactorRequest,
@@ -103,6 +104,10 @@ impl Modify for SecurityAddon {
         TwoFactorChallenge,
         ImageSummary,
         ImageListResponse,
+        FaceBox,
+        Face,
+        PersonSummary,
+        PeopleListResponse,
         ErrorResponse,
         HealthResponse,
     )),
@@ -110,6 +115,7 @@ impl Modify for SecurityAddon {
     tags(
         (name = "auth", description = "Login / logout"),
         (name = "images", description = "List, download and delete images"),
+        (name = "people", description = "Named people (faces)"),
         (name = "meta", description = "Service metadata"),
     )
 )]
@@ -176,6 +182,7 @@ async fn main() {
         .route("/images", get(list_images))
         .route("/images/:id", get(get_image))
         .route("/images/:id", delete(delete_image))
+        .route("/people", get(list_people))
         .route("/openapi.json", get(openapi_json))
         .route("/docs", get(swagger_ui))
         .with_state(state);
@@ -386,6 +393,12 @@ struct ListQuery {
     max_lon: Option<f64>,
     /// Title/filename substring match.
     filename: Option<String>,
+    /// Only items that have (`true`) or lack (`false`) detected faces.
+    has_faces: Option<bool>,
+    /// Only items with at least this many detected faces.
+    min_faces: Option<usize>,
+    /// Only items containing a detected person whose name matches (substring).
+    person: Option<String>,
     /// Force a re-sync from the museum instance.
     #[serde(default)]
     refresh: bool,
@@ -393,6 +406,28 @@ struct ListQuery {
     limit: usize,
     #[serde(default)]
     offset: usize,
+}
+
+/// A bounding box for a detected face, relative to the face image dimensions.
+#[derive(Serialize, ToSchema)]
+struct FaceBox {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+/// A single detected face, annotated with the person it belongs to (if known).
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct Face {
+    face_id: String,
+    #[serde(rename = "box")]
+    bounding_box: FaceBox,
+    score: f64,
+    blur: f64,
+    person_id: Option<String>,
+    person_name: Option<String>,
 }
 
 /// A single image's metadata.
@@ -413,14 +448,39 @@ struct ImageSummary {
     /// URL of the still-encrypted blob, so other apps can download it
     /// directly from the storage backend (e.g. the S3 bucket).
     download_url: String,
-    /// Always empty; Ente stores face/ML data in a separate dataset.
-    faces: Vec<Value>,
+    /// Detected faces (with person names where known), from Ente's separate
+    /// "mldata" dataset. Empty if face data is disabled or not yet computed.
+    faces: Vec<Face>,
+    /// Distinct names of people detected in this image.
+    people: Vec<String>,
+    /// Width of the image the face boxes are relative to.
+    face_image_width: Option<i64>,
+    /// Height of the image the face boxes are relative to.
+    face_image_height: Option<i64>,
 }
 
 #[derive(Serialize, ToSchema)]
 struct ImageListResponse {
     count: usize,
     images: Vec<ImageSummary>,
+}
+
+/// A named person and how many available images they appear in.
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct PersonSummary {
+    /// Stable Ente entity id for the person (cgroup id).
+    id: String,
+    /// Name the user assigned to this person.
+    name: String,
+    /// Number of (non-deleted) images in the library featuring this person.
+    image_count: usize,
+}
+
+#[derive(Serialize, ToSchema)]
+struct PeopleListResponse {
+    count: usize,
+    people: Vec<PersonSummary>,
 }
 
 fn default_limit() -> usize {
@@ -460,10 +520,39 @@ async fn ensure_library(
         .store
         .with_session(token, |s| s.secrets.master_key.clone())
         .ok_or_else(|| AppError(StatusCode::UNAUTHORIZED, "invalid or expired token".into()))?;
-    let library = files::fetch_library(client, &master_key).await?;
+    let mut library = files::fetch_library(client, &master_key).await?;
+
+    // Best-effort: enrich the library with detected faces and named people.
+    let people = if state.settings.fetch_faces {
+        let people = match faces::fetch_people(client, &master_key).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("failed to load people: {e}");
+                faces::PeopleIndex::default()
+            }
+        };
+        match faces::fetch_faces(
+            client,
+            &library,
+            &people,
+            state.settings.faces_batch_size,
+        )
+        .await
+        {
+            Ok(face_map) => faces::attach_faces(&mut library, face_map),
+            Err(e) => tracing::warn!("failed to load face data: {e}"),
+        }
+        Some(people)
+    } else {
+        None
+    };
+
     state
         .store
-        .with_session(token, |s| s.library = Some(library))
+        .with_session(token, |s| {
+            s.library = Some(library);
+            s.people = people;
+        })
         .ok_or_else(|| AppError(StatusCode::UNAUTHORIZED, "invalid or expired token".into()))?;
     Ok(())
 }
@@ -500,6 +589,9 @@ async fn list_images(
         min_lon: q.min_lon,
         max_lon: q.max_lon,
         filename: q.filename,
+        has_faces: q.has_faces,
+        min_faces: q.min_faces,
+        person: q.person,
     };
 
     let limit = q.limit.clamp(1, 10000);
@@ -518,6 +610,47 @@ async fn list_images(
                 .map(|f| f.as_json(&state.settings.download_url(f.id)))
                 .collect();
             json!({ "count": count, "images": page })
+        })
+        .ok_or_else(|| AppError(StatusCode::UNAUTHORIZED, "invalid or expired token".into()))?;
+
+    Ok(Json(result))
+}
+
+#[utoipa::path(
+    get,
+    path = "/people",
+    tag = "people",
+    responses(
+        (status = 200, description = "Named people and their image counts",
+            body = PeopleListResponse),
+        (status = 401, description = "Invalid or expired token", body = ErrorResponse),
+        (status = 502, description = "Upstream museum error", body = ErrorResponse),
+    ),
+    security(("bearer" = []))
+)]
+async fn list_people(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let token = require_token(&headers)?;
+    let client = authed_client(&state, &token)?;
+    ensure_library(&state, &client, &token, false).await?;
+
+    let result = state
+        .store
+        .with_session(&token, |s| {
+            let library = s.library.as_ref().unwrap();
+            let people = match s.people.as_ref() {
+                Some(p) => p.summaries(library),
+                None => Vec::new(),
+            };
+            let list: Vec<Value> = people
+                .into_iter()
+                .map(|(id, name, image_count)| {
+                    json!({ "id": id, "name": name, "imageCount": image_count })
+                })
+                .collect();
+            json!({ "count": list.len(), "people": list })
         })
         .ok_or_else(|| AppError(StatusCode::UNAUTHORIZED, "invalid or expired token".into()))?;
 

@@ -44,6 +44,18 @@ pub fn b64encode(value: &[u8]) -> String {
     STANDARD.encode(value)
 }
 
+/// Decompress a gzip stream (used for `cgroup`/mldata payloads, which Ente
+/// gzips before encryption). Supports multi-member gzip streams.
+pub fn gunzip(data: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    use std::io::Read;
+    let mut decoder = flate2::read::MultiGzDecoder::new(data);
+    let mut out = Vec::new();
+    decoder
+        .read_to_end(&mut out)
+        .map_err(|_| CryptoError::Crypto)?;
+    Ok(out)
+}
+
 /// URL-safe base64 *with* padding (matches Go `base64.URLEncoding`).
 pub fn b64encode_url(value: &[u8]) -> String {
     URL_SAFE.encode(value)

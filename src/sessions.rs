@@ -13,6 +13,7 @@ use base64::Engine;
 use rand::RngCore;
 
 use crate::account::AccountSecrets;
+use crate::faces::PeopleIndex;
 use crate::files::ImageFile;
 
 fn now() -> f64 {
@@ -33,6 +34,7 @@ pub struct Session {
     pub created_at: f64,
     pub last_used: f64,
     pub library: Option<HashMap<i64, ImageFile>>,
+    pub people: Option<PeopleIndex>,
 }
 
 struct PendingTwoFactor {
@@ -69,6 +71,7 @@ impl SessionStore {
             created_at: t,
             last_used: t,
             library: None,
+            people: None,
         };
         self.sessions.lock().unwrap().insert(token.clone(), session);
         token

@@ -24,6 +24,7 @@ server-side so clients receive plaintext images.
 | `GET` | `/images` | List/filter images. |
 | `GET` | `/images/{id}` | Download a single image, **decrypted**. |
 | `DELETE` | `/images/{id}` | Move an image to trash. |
+| `GET` | `/people` | List named people (faces) and their image counts. |
 | `GET` | `/health` | Liveness check. |
 | `GET` | `/openapi.json` | OpenAPI 3.1 schema. |
 | `GET` | `/docs` | Swagger UI (assets loaded from a CDN). |
@@ -40,13 +41,37 @@ All optional, combinable query params:
 - `has_location` — `true`/`false` (items with/without GPS)
 - `min_lat`, `max_lat`, `min_lon`, `max_lon` — bounding box
 - `filename` — title/filename substring
+- `has_faces` — `true`/`false` (items with/without detected faces)
+- `min_faces` — only items with at least this many detected faces
+- `person` — person name (substring match) of a detected face
 - `refresh` — `true` to force a re-sync from museum
 - `limit`, `offset` — pagination
 
-**Detected faces:** Ente stores face/ML data in a *separately-derived* dataset
-(not in core file metadata), and it is computed client-side. This adapter
-returns a stable empty `faces: []` field on each image as a documented stub;
-full face filtering would require replicating Ente's ML pipeline.
+**Detected faces:** Ente computes face/ML data client-side and stores it in a
+*separately-derived* dataset (Ente's "mldata"), with named people kept as
+encrypted `cgroup` user entities. This adapter fetches and decrypts both during
+sync, so every image carries a real `faces` array. Each face includes its
+bounding `box`, detection `score`, `blur`, and — when the face belongs to a
+person you've named in Ente — the `personId` and `personName`. Each image also
+exposes a `people` array (distinct names) and the `faceImageWidth`/
+`faceImageHeight` the boxes are relative to. Use `GET /people` to list all named
+people with how many images each appears in (handy for building per-person
+highlights). Face fetching can be disabled with `ENTE_FETCH_FACES=false`.
+
+### `GET /people`
+
+Returns named people (those you've assigned a name to in Ente) sorted by image
+count:
+
+```json
+{
+  "count": 2,
+  "people": [
+    { "id": "<entity-id>", "name": "Alice", "imageCount": 87 },
+    { "id": "<entity-id>", "name": "Bob", "imageCount": 41 }
+  ]
+}
+```
 
 ## How auth & decryption work
 
@@ -118,6 +143,8 @@ cargo test
 | `ENTE_DOWNLOAD_URL` | *(empty)* | Optional separate blob host; defaults to `ENTE_API_URL/files/download/{id}`. |
 | `ENTE_TIMEOUT` | `60` | Upstream request timeout (seconds). |
 | `SESSION_TTL` | `86400` | Session lifetime (seconds) for issued tokens. |
+| `ENTE_FETCH_FACES` | `true` | Fetch detected faces + named people during sync. |
+| `ENTE_FACES_BATCH` | `200` | Files per batch when fetching face/ML data. |
 
 ## Example
 
@@ -138,6 +165,14 @@ curl -s "localhost:8000/images/12345" \
 # 4. Delete one
 curl -s -X DELETE "localhost:8000/images/12345" \
   -H "Authorization: Bearer $TOKEN"
+
+# 5. List named people and their image counts
+curl -s "localhost:8000/people" \
+  -H "Authorization: Bearer $TOKEN" | jq
+
+# 6. All photos of "Alice" that have at least 2 faces
+curl -s "localhost:8000/images?person=Alice&min_faces=2" \
+  -H "Authorization: Bearer $TOKEN" | jq
 ```
 
 ## Security notes

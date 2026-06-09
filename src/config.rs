@@ -10,10 +10,21 @@ pub struct Settings {
     pub session_ttl: u64,
     pub host: String,
     pub port: u16,
+    /// Whether to fetch detected faces + person names from museum during sync.
+    pub fetch_faces: bool,
+    /// Number of files per `/files/data/fetch` batch when loading face data.
+    pub faces_batch_size: usize,
 }
 
 fn env_or(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+fn env_bool(key: &str, default: bool) -> bool {
+    match env::var(key) {
+        Ok(v) => matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+        Err(_) => default,
+    }
 }
 
 impl Settings {
@@ -25,6 +36,8 @@ impl Settings {
             session_ttl: env_or("SESSION_TTL", "86400").parse().unwrap_or(86400),
             host: env_or("HOST", "0.0.0.0"),
             port: env_or("PORT", "8000").parse().unwrap_or(8000),
+            fetch_faces: env_bool("ENTE_FETCH_FACES", true),
+            faces_batch_size: env_or("ENTE_FACES_BATCH", "200").parse().unwrap_or(200),
         }
     }
 
