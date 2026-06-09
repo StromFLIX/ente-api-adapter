@@ -52,7 +52,7 @@ impl ImageFile {
         media_type_name(self.file_type)
     }
 
-    pub fn as_json(&self) -> Value {
+    pub fn as_json(&self, download_url: &str) -> Value {
         json!({
             "id": self.id,
             "title": self.title,
@@ -65,6 +65,9 @@ impl ImageFile {
             "latitude": self.latitude,
             "longitude": self.longitude,
             "hash": self.file_hash,
+            // URL of the still-encrypted blob, so other apps can fetch it
+            // straight from the storage backend (e.g. the S3 bucket).
+            "downloadUrl": download_url,
             // Face/ML data is not part of core file metadata in Ente.
             "faces": [],
         })

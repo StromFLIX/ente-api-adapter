@@ -410,6 +410,9 @@ struct ImageSummary {
     latitude: Option<f64>,
     longitude: Option<f64>,
     hash: Option<String>,
+    /// URL of the still-encrypted blob, so other apps can download it
+    /// directly from the storage backend (e.g. the S3 bucket).
+    download_url: String,
     /// Always empty; Ente stores face/ML data in a separate dataset.
     faces: Vec<Value>,
 }
@@ -512,7 +515,7 @@ async fn list_images(
                 .into_iter()
                 .skip(offset)
                 .take(limit)
-                .map(|f| f.as_json())
+                .map(|f| f.as_json(&state.settings.download_url(f.id)))
                 .collect();
             json!({ "count": count, "images": page })
         })
@@ -561,6 +564,7 @@ async fn get_image(
     let data = files::download_image(&client, &state.settings, &file).await?;
     let media_type = sniff_media_type(&data);
     let filename = file.title.clone().unwrap_or_else(|| image_id.to_string());
+    let encrypted_url = state.settings.download_url(file.id);
 
     let response = Response::builder()
         .status(StatusCode::OK)
@@ -569,6 +573,9 @@ async fn get_image(
             axum::http::header::CONTENT_DISPOSITION,
             format!("inline; filename=\"{filename}\""),
         )
+        // Where the still-encrypted blob lives (e.g. the S3 bucket), so other
+        // apps can fetch it directly instead of via this decrypting endpoint.
+        .header("X-Encrypted-Download-Url", encrypted_url)
         .body(Body::from(data))
         .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(response)
