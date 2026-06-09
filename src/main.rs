@@ -34,6 +34,9 @@ struct AppState {
     /// backpressure so a burst of requests can't exhaust memory or starve the
     /// async runtime with CPU-bound decryption.
     download_sem: tokio::sync::Semaphore,
+    /// Serializes the (expensive) library fetch so a burst of cold-cache
+    /// requests can't fire N concurrent full-library refetches at museum.
+    library_fetch_lock: tokio::sync::Mutex<()>,
 }
 
 /// Error type rendered as `{"detail": "..."}` (matches the FastAPI adapter).
@@ -181,6 +184,7 @@ async fn main() {
         settings,
         store,
         download_sem,
+        library_fetch_lock: tokio::sync::Mutex::new(()),
     });
 
     let app = Router::new()
@@ -525,6 +529,26 @@ async fn ensure_library(
     if !needs_fetch {
         return Ok(());
     }
+
+    // Single-flight: only one library fetch runs at a time. A startup burst of
+    // cold-cache requests would otherwise each trigger a full library + faces
+    // refetch from museum, flooding it and wedging the whole adapter.
+    let _guard = state.library_fetch_lock.lock().await;
+
+    // Re-check under the lock: another task may have just populated the cache
+    // while we waited, in which case there's nothing to do (unless forced).
+    if !force {
+        let still_needed = state
+            .store
+            .with_session(token, |s| s.library.is_none())
+            .ok_or_else(|| {
+                AppError(StatusCode::UNAUTHORIZED, "invalid or expired token".into())
+            })?;
+        if !still_needed {
+            return Ok(());
+        }
+    }
+
     let master_key = state
         .store
         .with_session(token, |s| s.secrets.master_key.clone())
