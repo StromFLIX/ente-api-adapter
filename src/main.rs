@@ -553,38 +553,86 @@ async fn ensure_library(
         .store
         .with_session(token, |s| s.secrets.master_key.clone())
         .ok_or_else(|| AppError(StatusCode::UNAUTHORIZED, "invalid or expired token".into()))?;
-    let mut library = files::fetch_library(client, &master_key).await?;
-
-    // Best-effort: enrich the library with detected faces and named people.
-    let people = if state.settings.fetch_faces {
-        let people = match faces::fetch_people(client, &master_key).await {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!("failed to load people: {e}");
-                faces::PeopleIndex::default()
-            }
-        };
-        match faces::fetch_faces(
-            client,
-            &library,
-            &people,
-            state.settings.faces_batch_size,
-        )
-        .await
-        {
-            Ok(face_map) => faces::attach_faces(&mut library, face_map),
-            Err(e) => tracing::warn!("failed to load face data: {e}"),
-        }
-        Some(people)
-    } else {
-        None
-    };
+    let library = files::fetch_library(client, &master_key).await?;
 
     state
         .store
         .with_session(token, |s| {
             s.library = Some(library);
-            s.people = people;
+        })
+        .ok_or_else(|| AppError(StatusCode::UNAUTHORIZED, "invalid or expired token".into()))?;
+    Ok(())
+}
+
+/// Ensure faces/people are loaded. This is intentionally separate from
+/// `ensure_library`: ordinary `/images` calls should not pay the first-time face
+/// sync cost, which can take minutes on large libraries and block manual sync.
+async fn ensure_faces(
+    state: &AppState,
+    client: &MuseumClient,
+    token: &str,
+) -> Result<(), AppError> {
+    if !state.settings.fetch_faces {
+        return Ok(());
+    }
+
+    ensure_library(state, client, token, false).await?;
+
+    let needs_fetch = state
+        .store
+        .with_session(token, |s| s.people.is_none())
+        .ok_or_else(|| AppError(StatusCode::UNAUTHORIZED, "invalid or expired token".into()))?;
+    if !needs_fetch {
+        return Ok(());
+    }
+
+    let _guard = state.library_fetch_lock.lock().await;
+    let still_needed = state
+        .store
+        .with_session(token, |s| s.people.is_none())
+        .ok_or_else(|| AppError(StatusCode::UNAUTHORIZED, "invalid or expired token".into()))?;
+    if !still_needed {
+        return Ok(());
+    }
+
+    let master_key = state
+        .store
+        .with_session(token, |s| s.secrets.master_key.clone())
+        .ok_or_else(|| AppError(StatusCode::UNAUTHORIZED, "invalid or expired token".into()))?;
+    let people = match faces::fetch_people(client, &master_key).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("failed to load people: {e}");
+            faces::PeopleIndex::default()
+        }
+    };
+    let library = state
+        .store
+        .with_session(token, |s| s.library.clone())
+        .ok_or_else(|| AppError(StatusCode::UNAUTHORIZED, "invalid or expired token".into()))?
+        .ok_or_else(|| AppError(StatusCode::INTERNAL_SERVER_ERROR, "library missing".into()))?;
+    let face_map = match faces::fetch_faces(
+        client,
+        &library,
+        &people,
+        state.settings.faces_batch_size,
+    )
+    .await
+    {
+        Ok(face_map) => face_map,
+        Err(e) => {
+            tracing::warn!("failed to load face data: {e}");
+            Default::default()
+        }
+    };
+
+    state
+        .store
+        .with_session(token, |s| {
+            if let Some(library) = s.library.as_mut() {
+                faces::attach_faces(library, face_map);
+            }
+            s.people = Some(people);
         })
         .ok_or_else(|| AppError(StatusCode::UNAUTHORIZED, "invalid or expired token".into()))?;
     Ok(())
@@ -610,6 +658,10 @@ async fn list_images(
     let token = require_token(&headers)?;
     let client = authed_client(&state, &token)?;
     ensure_library(&state, &client, &token, q.refresh).await?;
+
+    if q.has_faces.is_some() || q.min_faces.is_some() || q.person.is_some() {
+        ensure_faces(&state, &client, &token).await?;
+    }
 
     let filter = ImageFilter {
         album: q.album,
@@ -667,7 +719,7 @@ async fn list_people(
 ) -> Result<Json<Value>, AppError> {
     let token = require_token(&headers)?;
     let client = authed_client(&state, &token)?;
-    ensure_library(&state, &client, &token, false).await?;
+    ensure_faces(&state, &client, &token).await?;
 
     let result = state
         .store
