@@ -30,4 +30,8 @@ ENV HOST=0.0.0.0 \
 
 EXPOSE 8000
 
+# The image has no shell/curl, so probe via the binary's built-in healthcheck.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD ["/ente-api", "healthcheck"]
+
 ENTRYPOINT ["/ente-api"]

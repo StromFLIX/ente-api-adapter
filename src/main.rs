@@ -149,6 +149,13 @@ const SWAGGER_UI_HTML: &str = r##"<!DOCTYPE html>
 
 #[tokio::main]
 async fn main() {
+    // Self-contained healthcheck mode: `ente-api healthcheck` performs an HTTP
+    // GET against the local /health endpoint and exits 0 (healthy) or 1.
+    // This lets the `scratch` image be probed without a shell or curl.
+    if std::env::args().nth(1).as_deref() == Some("healthcheck") {
+        std::process::exit(run_healthcheck().await);
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -185,6 +192,23 @@ async fn main() {
 
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
+}
+
+/// Probe the local `/health` endpoint; returns a process exit code (0 = healthy).
+async fn run_healthcheck() -> i32 {
+    let port = std::env::var("PORT").unwrap_or_else(|_| "8000".into());
+    let url = format!("http://127.0.0.1:{port}/health");
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return 1,
+    };
+    match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => 0,
+        _ => 1,
+    }
 }
 
 /// Error body returned on failures, e.g. `{"detail": "invalid or expired token"}`.
