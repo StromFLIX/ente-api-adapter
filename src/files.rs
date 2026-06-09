@@ -345,7 +345,12 @@ pub async fn download_image(
     let encrypted = client.get_bytes(&settings.download_url(file.id)).await?;
     let header = b64decode(&file.decryption_header)
         .map_err(|e| EnteApiError::Decode(e.to_string()))?;
-    decrypt_file_stream(&encrypted, &file.key, &header)
+    // Decryption is CPU-bound and can be multi-megabyte; run it on a blocking
+    // thread so it never stalls the async runtime's worker threads.
+    let key = file.key.clone();
+    tokio::task::spawn_blocking(move || decrypt_file_stream(&encrypted, &key, &header))
+        .await
+        .map_err(|e| EnteApiError::Decode(format!("decrypt task failed: {e}")))?
         .map_err(|e| EnteApiError::Decode(e.to_string()))
 }
 

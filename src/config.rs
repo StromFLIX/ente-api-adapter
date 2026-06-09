@@ -14,6 +14,10 @@ pub struct Settings {
     pub fetch_faces: bool,
     /// Number of files per `/files/data/fetch` batch when loading face data.
     pub faces_batch_size: usize,
+    /// Max number of image download+decrypt operations to run at once. Acts as
+    /// backpressure so a burst of `/images/{id}` requests can't exhaust memory
+    /// or starve the runtime.
+    pub max_concurrent_downloads: usize,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -38,6 +42,10 @@ impl Settings {
             port: env_or("PORT", "8000").parse().unwrap_or(8000),
             fetch_faces: env_bool("ENTE_FETCH_FACES", true),
             faces_batch_size: env_or("ENTE_FACES_BATCH", "200").parse().unwrap_or(200),
+            max_concurrent_downloads: env_or("MAX_CONCURRENT_DOWNLOADS", "4")
+                .parse()
+                .unwrap_or(4)
+                .max(1),
         }
     }
 

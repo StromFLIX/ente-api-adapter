@@ -30,6 +30,10 @@ use crate::sessions::SessionStore;
 struct AppState {
     settings: Settings,
     store: SessionStore,
+    /// Limits concurrent image download+decrypt operations. Provides
+    /// backpressure so a burst of requests can't exhaust memory or starve the
+    /// async runtime with CPU-bound decryption.
+    download_sem: tokio::sync::Semaphore,
 }
 
 /// Error type rendered as `{"detail": "..."}` (matches the FastAPI adapter).
@@ -172,7 +176,12 @@ async fn main() {
     let settings = Settings::from_env();
     let addr = format!("{}:{}", settings.host, settings.port);
     let store = SessionStore::new(settings.session_ttl);
-    let state = Arc::new(AppState { settings, store });
+    let download_sem = tokio::sync::Semaphore::new(settings.max_concurrent_downloads);
+    let state = Arc::new(AppState {
+        settings,
+        store,
+        download_sem,
+    });
 
     let app = Router::new()
         .route("/health", get(health))
@@ -693,6 +702,14 @@ async fn get_image(
         Some(f) if !f.is_deleted => f,
         _ => return Err(AppError(StatusCode::NOT_FOUND, "image not found".into())),
     };
+
+    // Backpressure: cap concurrent download+decrypt work. Excess requests wait
+    // here rather than piling up unbounded heavy operations on the runtime.
+    let _permit = state
+        .download_sem
+        .acquire()
+        .await
+        .map_err(|e| AppError(StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
 
     let data = files::download_image(&client, &state.settings, &file).await?;
     let media_type = sniff_media_type(&data);

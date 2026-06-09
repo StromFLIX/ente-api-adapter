@@ -9,6 +9,9 @@ services:
       ENTE_DOWNLOAD_URL: ${ENTE_DOWNLOAD_URL:-}
       ENTE_TIMEOUT: ${ENTE_TIMEOUT:-60}
       SESSION_TTL: ${SESSION_TTL:-86400}
+      # Cap concurrent image download+decrypt work so a burst of requests can't
+      # exhaust memory or starve the runtime.
+      MAX_CONCURRENT_DOWNLOADS: ${MAX_CONCURRENT_DOWNLOADS:-4}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
