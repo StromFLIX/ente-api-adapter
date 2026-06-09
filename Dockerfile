@@ -1,29 +1,33 @@
 # syntax=docker/dockerfile:1
 
-FROM python:3.12-slim AS base
+# --- Build stage: static musl binary --------------------------------------
+FROM rust:alpine AS builder
 
-# libsodium is required by pysodium for Ente-compatible crypto.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends libsodium23 \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install uv (fast Python package manager).
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
-
-ENV UV_COMPILE_BYTECODE=1 \
-    UV_LINK_MODE=copy \
-    UV_PROJECT_ENVIRONMENT=/usr/local
+# musl-dev for libc headers; the rest are needed to build the rustls crypto
+# provider (aws-lc-rs) from source under musl.
+RUN apk add --no-cache musl-dev build-base cmake perl
 
 WORKDIR /app
 
-# Install dependencies first for better layer caching.
-COPY pyproject.toml ./
-RUN uv pip install --system \
-    "fastapi>=0.115" "uvicorn[standard]>=0.30" "httpx>=0.27" \
-    "pysodium>=0.7.18" "pydantic>=2.7" "pydantic-settings>=2.3" "python-dotenv>=1.0"
+# Cache dependencies first.
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo 'fn main() {}' > src/main.rs \
+    && cargo build --release \
+    && rm -rf src
 
-COPY app ./app
+COPY src ./src
+# Touch main so cargo rebuilds with the real sources.
+RUN touch src/main.rs && cargo build --release \
+    && strip target/release/ente-api
+
+# --- Runtime stage: scratch (just the static binary) ----------------------
+FROM scratch
+
+COPY --from=builder /app/target/release/ente-api /ente-api
+
+ENV HOST=0.0.0.0 \
+    PORT=8000
 
 EXPOSE 8000
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+ENTRYPOINT ["/ente-api"]

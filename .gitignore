@@ -1,9 +1,5 @@
-.venv/
-__pycache__/
-*.pyc
+# Rust build artifacts
+/target/
+
+# Environment
 .env
-.uv/
-dist/
-build/
-*.egg-info/
-.ruff_cache/

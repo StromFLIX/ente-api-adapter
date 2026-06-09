@@ -1,6 +1,7 @@
 # ente-api
 
-A small **FastAPI** adapter in front of a single self-hosted
+A small, **single-binary Rust** adapter (built on [axum](https://github.com/tokio-rs/axum))
+in front of a single self-hosted
 [Ente](https://github.com/ente-io/ente) **"museum"** instance.
 
 It logs in with your Ente credentials (SRP, optional TOTP), keeps the decrypted
@@ -9,8 +10,9 @@ keys **in memory**, and exposes a simple REST API to **list**, **fetch
 server-side so clients receive plaintext images.
 
 > Ente's museum API is unpublished/undocumented. This adapter reimplements the
-> auth and crypto flows from Ente's open-source Go CLI and uses **libsodium**
-> for byte-for-byte compatibility.
+> auth and crypto flows from Ente's open-source Go CLI. The crypto is built on
+> the pure-Rust, libsodium-compatible [`dryoc`](https://crates.io/crates/dryoc)
+> crate and is verified **byte-for-byte** against libsodium with test vectors.
 
 ## Endpoints
 
@@ -23,6 +25,8 @@ server-side so clients receive plaintext images.
 | `GET` | `/images/{id}` | Download a single image, **decrypted**. |
 | `DELETE` | `/images/{id}` | Move an image to trash. |
 | `GET` | `/health` | Liveness check. |
+| `GET` | `/openapi.json` | OpenAPI 3.1 schema. |
+| `GET` | `/docs` | Swagger UI (assets loaded from a CDN). |
 
 Authenticated routes expect `Authorization: Bearer <token>`.
 
@@ -58,14 +62,29 @@ full face filtering would require replicating Ente's ML pipeline.
 The adapter issues its **own opaque bearer token** and holds the decrypted keys
 in process memory only. They are never written to disk and are lost on restart.
 
+## Footprint
+
+The project compiles to a single static binary on a `scratch` image — no OS,
+no runtime, no system libraries. For reference, here is how it compared to an
+earlier Python/FastAPI prototype (`wrk`, 4 threads / 50 connections, `GET /health`):
+
+| Metric | Python (FastAPI) | Rust (axum) | Improvement |
+| ------ | ---------------- | ----------- | ----------- |
+| Docker image | 281 MB | **3.3 MB** | ~85× smaller |
+| Idle RAM | 41 MiB | **1.4 MiB** | ~29× less |
+| RAM under load | 41.6 MiB | **3.2 MiB** | ~13× less |
+| Throughput | 4,386 req/s | **39,704 req/s** | ~9× faster |
+| Latency p50 | 12.15 ms | **1.01 ms** | ~12× lower |
+| Latency p99 | 24.93 ms | **4.97 ms** | ~5× lower |
+
 ## Run with Docker (recommended)
 
-libsodium is installed in the image.
+The image is a static binary on `scratch`; nothing else is installed.
 
 ```bash
-cp .env.example .env          # set ENTE_API_URL to your museum instance
+cp .env.example .env        # set ENTE_API_URL to your museum instance
 docker compose up --build
-# API on http://localhost:8000  (docs at /docs)
+# API on http://localhost:8000
 ```
 
 Or with plain Docker:
@@ -75,14 +94,20 @@ docker build -t ente-api .
 docker run --rm -p 8000:8000 -e ENTE_API_URL=https://api.ente.example.com ente-api
 ```
 
-## Run locally with uv
+## Run locally with Cargo
 
-Requires libsodium on the host (`apt install libsodium23` / `brew install libsodium`).
+Requires a [Rust toolchain](https://rustup.rs/) (stable). No system libraries
+are needed — the crypto is pure Rust.
 
 ```bash
-uv sync
 cp .env.example .env
-uv run uvicorn app.main:app --reload
+cargo run --release
+```
+
+Run the crypto/SRP compatibility tests (vectors are checked into `tests/`):
+
+```bash
+cargo test
 ```
 
 ## Configuration (.env)
