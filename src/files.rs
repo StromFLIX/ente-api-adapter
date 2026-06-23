@@ -37,6 +37,9 @@ pub struct ImageFile {
     pub album_name: String,
     pub key: Vec<u8>,
     pub decryption_header: String,
+    /// Secretstream header for the separately-stored thumbnail blob (same file
+    /// key, different header). Empty when no thumbnail is available.
+    pub thumbnail_decryption_header: String,
     pub file_size: Option<i64>,
     pub title: Option<String>,
     pub file_type: i64,
@@ -193,6 +196,7 @@ fn decrypt_file(raw: &Value, album: &Album) -> Option<ImageFile> {
             album_name: album.name.clone(),
             key: Vec::new(),
             decryption_header: String::new(),
+            thumbnail_decryption_header: String::new(),
             file_size: None,
             title: None,
             file_type: FILE_TYPE_IMAGE,
@@ -249,6 +253,13 @@ fn decrypt_file(raw: &Value, album: &Album) -> Option<ImageFile> {
         .and_then(|v| v.as_str())?
         .to_string();
 
+    let thumbnail_decryption_header = raw
+        .get("thumbnail")
+        .and_then(|f| f.get("decryptionHeader"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
     let file_type = metadata
         .get("fileType")
         .and_then(as_i64)
@@ -260,6 +271,7 @@ fn decrypt_file(raw: &Value, album: &Album) -> Option<ImageFile> {
         album_name: album.name.clone(),
         key: file_key,
         decryption_header,
+        thumbnail_decryption_header,
         file_size,
         title,
         file_type,
@@ -347,6 +359,24 @@ pub async fn download_image(
         .map_err(|e| EnteApiError::Decode(e.to_string()))?;
     // Decryption is CPU-bound and can be multi-megabyte; run it on a blocking
     // thread so it never stalls the async runtime's worker threads.
+    let key = file.key.clone();
+    tokio::task::spawn_blocking(move || decrypt_file_stream(&encrypted, &key, &header))
+        .await
+        .map_err(|e| EnteApiError::Decode(format!("decrypt task failed: {e}")))?
+        .map_err(|e| EnteApiError::Decode(e.to_string()))
+}
+
+pub async fn download_thumbnail(
+    client: &MuseumClient,
+    settings: &Settings,
+    file: &ImageFile,
+) -> Result<Vec<u8>, EnteApiError> {
+    if file.thumbnail_decryption_header.is_empty() {
+        return Err(EnteApiError::Status(404, "thumbnail not available".into()));
+    }
+    let encrypted = client.get_bytes(&settings.thumbnail_url(file.id)).await?;
+    let header = b64decode(&file.thumbnail_decryption_header)
+        .map_err(|e| EnteApiError::Decode(e.to_string()))?;
     let key = file.key.clone();
     tokio::task::spawn_blocking(move || decrypt_file_stream(&encrypted, &key, &header))
         .await

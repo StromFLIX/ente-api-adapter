@@ -60,4 +60,10 @@ impl Settings {
             format!("{}/files/download/{}", self.api_base(), file_id)
         }
     }
+
+    /// Museum endpoint that 307-redirects to the (still-encrypted) thumbnail
+    /// blob in storage. Always routed via museum so it can issue the redirect.
+    pub fn thumbnail_url(&self, file_id: i64) -> String {
+        format!("{}/files/preview/{}", self.api_base(), file_id)
+    }
 }

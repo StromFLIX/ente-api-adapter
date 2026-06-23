@@ -103,7 +103,7 @@ impl Modify for SecurityAddon {
             with your Ente credentials to receive a bearer token, then list, fetch \
             (decrypted) and delete images."
     ),
-    paths(health, auth, auth_two_factor, logout, list_images, list_people, get_image, delete_image),
+    paths(health, auth, auth_two_factor, logout, list_images, list_people, get_image, get_thumbnail, delete_image),
     components(schemas(
         AuthRequest,
         TwoFactorRequest,
@@ -194,6 +194,7 @@ async fn main() {
         .route("/auth/session", delete(logout))
         .route("/images", get(list_images))
         .route("/images/:id", get(get_image))
+        .route("/images/:id/thumbnail", get(get_thumbnail))
         .route("/images/:id", delete(delete_image))
         .route("/people", get(list_people))
         .route("/openapi.json", get(openapi_json))
@@ -802,6 +803,65 @@ async fn get_image(
         // Where the still-encrypted blob lives (e.g. the S3 bucket), so other
         // apps can fetch it directly instead of via this decrypting endpoint.
         .header("X-Encrypted-Download-Url", encrypted_url)
+        .body(Body::from(data))
+        .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(response)
+}
+
+#[utoipa::path(
+    get,
+    path = "/images/{id}/thumbnail",
+    tag = "images",
+    params(("id" = i64, Path, description = "Image id")),
+    responses(
+        (status = 200, description = "Decrypted thumbnail bytes"),
+        (status = 401, description = "Invalid or expired token", body = ErrorResponse),
+        (status = 404, description = "Thumbnail not found", body = ErrorResponse),
+        (status = 502, description = "Upstream museum error", body = ErrorResponse),
+    ),
+    security(("bearer" = []))
+)]
+async fn get_thumbnail(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(image_id): Path<i64>,
+) -> Result<Response, AppError> {
+    let token = require_token(&headers)?;
+    let client = authed_client(&state, &token)?;
+    ensure_library(&state, &client, &token, false).await?;
+
+    let file = state
+        .store
+        .with_session(&token, |s| {
+            s.library.as_ref().and_then(|l| l.get(&image_id).cloned())
+        })
+        .ok_or_else(|| AppError(StatusCode::UNAUTHORIZED, "invalid or expired token".into()))?;
+
+    let file = match file {
+        Some(f) if !f.is_deleted => f,
+        _ => return Err(AppError(StatusCode::NOT_FOUND, "image not found".into())),
+    };
+
+    let _permit = state
+        .download_sem
+        .acquire()
+        .await
+        .map_err(|e| AppError(StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
+
+    let data = files::download_thumbnail(&client, &state.settings, &file).await?;
+    let media_type = sniff_media_type(&data);
+    let filename = format!(
+        "{}-thumb",
+        file.title.clone().unwrap_or_else(|| image_id.to_string())
+    );
+
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, media_type)
+        .header(
+            axum::http::header::CONTENT_DISPOSITION,
+            format!("inline; filename=\"{filename}\""),
+        )
         .body(Body::from(data))
         .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(response)
