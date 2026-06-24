@@ -560,15 +560,20 @@ async fn ensure_library(
         .store
         .with_session(token, |s| {
             s.library = Some(library);
+            // A fresh library invalidates the people/face annotations attached to
+            // the previous one; let the cheap/expensive paths re-derive them.
+            s.people = None;
+            s.faces_loaded = false;
         })
         .ok_or_else(|| AppError(StatusCode::UNAUTHORIZED, "invalid or expired token".into()))?;
     Ok(())
 }
 
-/// Ensure faces/people are loaded. This is intentionally separate from
-/// `ensure_library`: ordinary `/images` calls should not pay the first-time face
-/// sync cost, which can take minutes on large libraries and block manual sync.
-async fn ensure_faces(
+/// Ensure named people are loaded and attached to the library. This is the
+/// cheap path: it fetches the "cgroup" entities (named people) and derives each
+/// file's people from them directly, without the expensive per-file mldata face
+/// fetch. Used by `/people` and by person-filtered `/images`.
+async fn ensure_people(
     state: &AppState,
     client: &MuseumClient,
     token: &str,
@@ -607,11 +612,60 @@ async fn ensure_faces(
             faces::PeopleIndex::default()
         }
     };
-    let library = state
+
+    state
         .store
-        .with_session(token, |s| s.library.clone())
-        .ok_or_else(|| AppError(StatusCode::UNAUTHORIZED, "invalid or expired token".into()))?
+        .with_session(token, |s| {
+            if let Some(library) = s.library.as_mut() {
+                faces::attach_people(library, &people);
+            }
+            s.people = Some(people);
+        })
+        .ok_or_else(|| AppError(StatusCode::UNAUTHORIZED, "invalid or expired token".into()))?;
+    Ok(())
+}
+
+/// Ensure detected face boxes (Ente's per-file "mldata") are loaded. This is the
+/// expensive path — one decrypt per file, minutes on large libraries — and is
+/// only needed for face-box detail or `has_faces`/`min_faces` filtering. People
+/// listing and person filtering use the much cheaper `ensure_people`.
+async fn ensure_faces(
+    state: &AppState,
+    client: &MuseumClient,
+    token: &str,
+) -> Result<(), AppError> {
+    if !state.settings.fetch_faces {
+        return Ok(());
+    }
+
+    // Named people (and their per-file assignments) first: cheap and always wanted.
+    ensure_people(state, client, token).await?;
+
+    let needs_fetch = state
+        .store
+        .with_session(token, |s| !s.faces_loaded)
+        .ok_or_else(|| AppError(StatusCode::UNAUTHORIZED, "invalid or expired token".into()))?;
+    if !needs_fetch {
+        return Ok(());
+    }
+
+    let _guard = state.library_fetch_lock.lock().await;
+    let still_needed = state
+        .store
+        .with_session(token, |s| !s.faces_loaded)
+        .ok_or_else(|| AppError(StatusCode::UNAUTHORIZED, "invalid or expired token".into()))?;
+    if !still_needed {
+        return Ok(());
+    }
+
+    let (library, people) = state
+        .store
+        .with_session(token, |s| (s.library.clone(), s.people.clone()))
+        .ok_or_else(|| AppError(StatusCode::UNAUTHORIZED, "invalid or expired token".into()))?;
+    let library = library
         .ok_or_else(|| AppError(StatusCode::INTERNAL_SERVER_ERROR, "library missing".into()))?;
+    let people = people.unwrap_or_default();
+
     let face_map = match faces::fetch_faces(
         client,
         &library,
@@ -633,7 +687,7 @@ async fn ensure_faces(
             if let Some(library) = s.library.as_mut() {
                 faces::attach_faces(library, face_map);
             }
-            s.people = Some(people);
+            s.faces_loaded = true;
         })
         .ok_or_else(|| AppError(StatusCode::UNAUTHORIZED, "invalid or expired token".into()))?;
     Ok(())
@@ -660,7 +714,11 @@ async fn list_images(
     let client = authed_client(&state, &token)?;
     ensure_library(&state, &client, &token, q.refresh).await?;
 
-    if q.has_faces.is_some() || q.min_faces.is_some() || q.person.is_some() {
+    // Named people are cheap to attach and let callers (e.g. the highlights
+    // ingest) populate per-image people. Detected face boxes are only fetched
+    // when explicitly filtering on face counts, since that is the slow path.
+    ensure_people(&state, &client, &token).await?;
+    if q.has_faces.is_some() || q.min_faces.is_some() {
         ensure_faces(&state, &client, &token).await?;
     }
 
@@ -720,7 +778,7 @@ async fn list_people(
 ) -> Result<Json<Value>, AppError> {
     let token = require_token(&headers)?;
     let client = authed_client(&state, &token)?;
-    ensure_faces(&state, &client, &token).await?;
+    ensure_people(&state, &client, &token).await?;
 
     let result = state
         .store

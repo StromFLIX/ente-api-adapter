@@ -92,7 +92,7 @@ pub struct Person {
 }
 
 /// Lookup tables joining faces/files back to named people.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct PeopleIndex {
     /// All named, non-hidden people, keyed by entity id.
     pub people: HashMap<String, Person>,
@@ -140,6 +140,36 @@ impl PeopleIndex {
             .collect();
         out.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1)));
         out
+    }
+
+    /// Reverse index `fileID -> distinct person names` assigned to that file via
+    /// cgroup entities (`assigned` faces + `manuallyAssigned`). This is derived
+    /// purely from the people index, so it needs no per-file mldata fetch.
+    pub fn file_person_names(&self) -> HashMap<i64, Vec<String>> {
+        let mut out: HashMap<i64, Vec<String>> = HashMap::new();
+        for person in self.people.values() {
+            if let Some(fids) = self.person_file_ids.get(&person.id) {
+                for fid in fids {
+                    let entry = out.entry(*fid).or_default();
+                    if !entry.contains(&person.name) {
+                        entry.push(person.name.clone());
+                    }
+                }
+            }
+        }
+        for names in out.values_mut() {
+            names.sort();
+        }
+        out
+    }
+}
+
+/// Attach cgroup-derived person names onto every file in the library. Cheap:
+/// no network or mldata; just a reverse lookup over the people index.
+pub fn attach_people(files: &mut HashMap<i64, ImageFile>, index: &PeopleIndex) {
+    let map = index.file_person_names();
+    for file in files.values_mut() {
+        file.cgroup_people = map.get(&file.id).cloned().unwrap_or_default();
     }
 }
 

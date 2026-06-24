@@ -55,6 +55,10 @@ pub struct ImageFile {
     /// Dimensions of the image the face boxes are relative to.
     pub face_image_width: Option<i64>,
     pub face_image_height: Option<i64>,
+    /// Named people assigned to this file via Ente "cgroup" entities. Derived
+    /// directly from the people index (no per-file mldata needed), so it is
+    /// available cheaply without the expensive face-box fetch.
+    pub cgroup_people: Vec<String>,
 }
 
 impl ImageFile {
@@ -62,10 +66,19 @@ impl ImageFile {
         media_type_name(self.file_type)
     }
 
-    /// Distinct names of people detected in this image, in stable order.
+    /// Distinct names of people present in this image, in stable order.
+    ///
+    /// Combines people assigned via "cgroup" entities (cheap; always available
+    /// once the people index is loaded) with any names resolved from detected
+    /// face boxes (only present after the optional mldata fetch).
     pub fn person_names(&self) -> Vec<String> {
         let mut seen = std::collections::HashSet::new();
         let mut names = Vec::new();
+        for name in &self.cgroup_people {
+            if seen.insert(name.clone()) {
+                names.push(name.clone());
+            }
+        }
         for face in &self.faces {
             if let Some(name) = &face.person_name {
                 if seen.insert(name.clone()) {
@@ -209,6 +222,7 @@ fn decrypt_file(raw: &Value, album: &Album) -> Option<ImageFile> {
             faces: Vec::new(),
             face_image_width: None,
             face_image_height: None,
+            cgroup_people: Vec::new(),
         });
     }
 
@@ -284,6 +298,7 @@ fn decrypt_file(raw: &Value, album: &Album) -> Option<ImageFile> {
         faces: Vec::new(),
         face_image_width: None,
         face_image_height: None,
+        cgroup_people: Vec::new(),
     })
 }
 
@@ -490,11 +505,10 @@ pub fn filter_images<'a>(
                 }
             }
             if let Some(p) = &person_lc {
-                let matched = file.faces.iter().any(|fc| {
-                    fc.person_name
-                        .as_ref()
-                        .map_or(false, |n| n.to_lowercase().contains(p))
-                });
+                let matched = file
+                    .person_names()
+                    .iter()
+                    .any(|n| n.to_lowercase().contains(p));
                 if !matched {
                     return false;
                 }

@@ -35,6 +35,8 @@ pub struct Session {
     pub last_used: f64,
     pub library: Option<HashMap<i64, ImageFile>>,
     pub people: Option<PeopleIndex>,
+    /// Whether the (expensive) per-file mldata face boxes have been fetched.
+    pub faces_loaded: bool,
 }
 
 struct PendingTwoFactor {
@@ -72,6 +74,7 @@ impl SessionStore {
             last_used: t,
             library: None,
             people: None,
+            faces_loaded: false,
         };
         self.sessions.lock().unwrap().insert(token.clone(), session);
         token
