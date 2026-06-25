@@ -47,16 +47,22 @@ All optional, combinable query params:
 - `refresh` — `true` to force a re-sync from museum
 - `limit`, `offset` — pagination
 
-**Detected faces:** Ente computes face/ML data client-side and stores it in a
-*separately-derived* dataset (Ente's "mldata"), with named people kept as
-encrypted `cgroup` user entities. This adapter fetches and decrypts both during
-sync, so every image carries a real `faces` array. Each face includes its
-bounding `box`, detection `score`, `blur`, and — when the face belongs to a
-person you've named in Ente — the `personId` and `personName`. Each image also
-exposes a `people` array (distinct names) and the `faceImageWidth`/
-`faceImageHeight` the boxes are relative to. Use `GET /people` to list all named
-people with how many images each appears in (handy for building per-person
-highlights). Face fetching can be disabled with `ENTE_FETCH_FACES=false`.
+**Named people vs. detected faces.** Ente keeps named people as encrypted `cgroup`
+user entities and per-image face/ML inference in a *separately-derived* dataset
+(Ente's "mldata"). The adapter treats them as two tiers:
+
+- **People** (cheap) — fetched from the `cgroup` entities. Each image exposes a
+  `people` array (distinct names), and `GET /people` lists everyone you've named
+  with their image counts. This needs no per-file decryption, so `/people` and
+  person-filtered `/images` are fast.
+- **Face boxes** (slow) — the per-file mldata, fetched only when you ask for face
+  detail or filter on counts (`has_faces` / `min_faces`). When loaded, every image
+  also carries a `faces` array (bounding `box`, detection `score`, `blur`, and the
+  `personId`/`personName` when known) plus the `faceImageWidth`/`faceImageHeight`
+  the boxes are relative to.
+
+Use `?refresh=true` to force a re-pull from museum (e.g. after naming new people in
+Ente). Face fetching can be disabled entirely with `ENTE_FETCH_FACES=false`.
 
 ### `GET /people`
 
