@@ -18,6 +18,10 @@ pub struct Settings {
     /// backpressure so a burst of `/images/{id}` requests can't exhaust memory
     /// or starve the runtime.
     pub max_concurrent_downloads: usize,
+    /// Same, but for thumbnails. Kept separate and much higher: thumbnails are
+    /// tens of KB, so they must never queue behind multi-MB full-image
+    /// downloads -- that is what makes a grid of photos stall.
+    pub max_concurrent_thumbnails: usize,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -45,6 +49,10 @@ impl Settings {
             max_concurrent_downloads: env_or("MAX_CONCURRENT_DOWNLOADS", "4")
                 .parse()
                 .unwrap_or(4)
+                .max(1),
+            max_concurrent_thumbnails: env_or("MAX_CONCURRENT_THUMBNAILS", "32")
+                .parse()
+                .unwrap_or(32)
                 .max(1),
         }
     }

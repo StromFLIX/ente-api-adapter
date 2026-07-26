@@ -151,6 +151,19 @@ cargo test
 | `SESSION_TTL` | `86400` | Session lifetime (seconds) for issued tokens. |
 | `ENTE_FETCH_FACES` | `true` | Fetch detected faces + named people during sync. |
 | `ENTE_FACES_BATCH` | `200` | Files per batch when fetching face/ML data. |
+| `MAX_CONCURRENT_DOWNLOADS` | `4` | Concurrent full-image downloads. |
+| `MAX_CONCURRENT_THUMBNAILS` | `32` | Concurrent thumbnails. Kept separate from downloads on purpose: sharing one 4-permit gate meant a handful of in-flight originals stalled every thumbnail in a grid. |
+
+## Image delivery
+
+`GET /images/{id}` streams. The encrypted blob is pulled from storage and
+decrypted a chunk at a time (`crypto::FileDecryptor`), so the response starts as
+soon as the first 4 MiB frame is authenticated rather than after the whole file
+has been downloaded and decrypted. Nothing holds a full-size original in memory.
+
+Connections are pooled process-wide (`MUSEUM_POOL` / `STORAGE_POOL`). Building a
+`reqwest::Client` per request throws away the connection pool it owns, which
+costs a fresh DNS + TCP + TLS handshake on every image.
 
 ## Example
 

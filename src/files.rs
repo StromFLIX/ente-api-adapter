@@ -2,11 +2,15 @@
 
 use std::collections::HashMap;
 
+use axum::body::Bytes;
+use futures_util::{Stream, StreamExt};
 use serde_json::{json, Value};
 
 use crate::client::{EnteApiError, MuseumClient};
 use crate::config::Settings;
-use crate::crypto::{b64decode, decrypt_chacha, decrypt_file_stream, secretbox_open};
+use crate::crypto::{
+    b64decode, decrypt_chacha, decrypt_file_stream, secretbox_open, FileDecryptor,
+};
 use crate::faces::DetectedFace;
 
 pub const FILE_TYPE_IMAGE: i64 = 0;
@@ -364,21 +368,78 @@ pub async fn fetch_library(
     Ok(files)
 }
 
-pub async fn download_image(
+/// Pull ciphertext until another piece of plaintext is ready, or the stream ends.
+async fn next_plaintext<S>(
+    body: &mut S,
+    decryptor: &mut FileDecryptor,
+) -> Result<Option<Bytes>, EnteApiError>
+where
+    S: Stream<Item = reqwest::Result<Bytes>> + Unpin,
+{
+    loop {
+        match body.next().await {
+            Some(chunk) => {
+                let chunk = chunk.map_err(|e| EnteApiError::Transport(e.to_string()))?;
+                let plain = decryptor
+                    .push(&chunk)
+                    .map_err(|e| EnteApiError::Decode(e.to_string()))?;
+                if !plain.is_empty() {
+                    return Ok(Some(Bytes::from(plain)));
+                }
+            }
+            None => {
+                let tail = decryptor
+                    .finish()
+                    .map_err(|e| EnteApiError::Decode(e.to_string()))?;
+                return Ok(if tail.is_empty() {
+                    None
+                } else {
+                    Some(Bytes::from(tail))
+                });
+            }
+        }
+    }
+}
+
+/// Stream a file blob, decrypting it chunk-by-chunk as it arrives.
+///
+/// [`download_image`] buffers the whole encrypted file, decrypts it, and only
+/// then starts responding, so time-to-first-byte is the sum of every stage and
+/// the client's socket is idle throughout -- which is what makes large photos
+/// look like a hang and trips HTTP read timeouts. This overlaps the download,
+/// the decryption and the response, and never holds the whole file in memory.
+///
+/// Returns `(head, body)`. `head` is the first decrypted chunk, pulled eagerly
+/// so the caller can sniff a content type before sending headers; `body` yields
+/// `head` again followed by the remainder. Cloning `Bytes` is a refcount bump,
+/// so this costs no extra copy.
+pub async fn download_image_stream(
     client: &MuseumClient,
     settings: &Settings,
     file: &ImageFile,
-) -> Result<Vec<u8>, EnteApiError> {
-    let encrypted = client.get_bytes(&settings.download_url(file.id)).await?;
-    let header = b64decode(&file.decryption_header)
+) -> Result<(Bytes, impl Stream<Item = Result<Bytes, EnteApiError>>), EnteApiError> {
+    let header =
+        b64decode(&file.decryption_header).map_err(|e| EnteApiError::Decode(e.to_string()))?;
+    let mut decryptor = FileDecryptor::new(&file.key, &header)
         .map_err(|e| EnteApiError::Decode(e.to_string()))?;
-    // Decryption is CPU-bound and can be multi-megabyte; run it on a blocking
-    // thread so it never stalls the async runtime's worker threads.
-    let key = file.key.clone();
-    tokio::task::spawn_blocking(move || decrypt_file_stream(&encrypted, &key, &header))
-        .await
-        .map_err(|e| EnteApiError::Decode(format!("decrypt task failed: {e}")))?
-        .map_err(|e| EnteApiError::Decode(e.to_string()))
+
+    // Resolve the redirect and check the status *before* returning, so an
+    // upstream failure is still an error response rather than a truncated 200.
+    let resp = client.get_stream(&settings.download_url(file.id)).await?;
+    let mut body = Box::pin(resp.bytes_stream());
+
+    let head = next_plaintext(&mut body, &mut decryptor)
+        .await?
+        .unwrap_or_default();
+    let first = head.clone();
+
+    let stream = async_stream::try_stream! {
+        yield first;
+        while let Some(plain) = next_plaintext(&mut body, &mut decryptor).await? {
+            yield plain;
+        }
+    };
+    Ok((head, stream))
 }
 
 pub async fn download_thumbnail(

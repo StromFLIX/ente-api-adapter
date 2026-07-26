@@ -12,6 +12,9 @@ services:
       # Cap concurrent image download+decrypt work so a burst of requests can't
       # exhaust memory or starve the runtime.
       MAX_CONCURRENT_DOWNLOADS: ${MAX_CONCURRENT_DOWNLOADS:-4}
+      # Thumbnails get their own, much larger budget -- they are tens of KB and
+      # must not queue behind multi-MB full-image downloads.
+      MAX_CONCURRENT_THUMBNAILS: ${MAX_CONCURRENT_THUMBNAILS:-32}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped

@@ -33,7 +33,11 @@ struct AppState {
     /// Limits concurrent image download+decrypt operations. Provides
     /// backpressure so a burst of requests can't exhaust memory or starve the
     /// async runtime with CPU-bound decryption.
-    download_sem: tokio::sync::Semaphore,
+    download_sem: Arc<tokio::sync::Semaphore>,
+    /// Separate, much larger budget for thumbnails. They are tens of KB, so
+    /// sharing `download_sem` with multi-MB full images meant one slow photo
+    /// could stall an entire grid of thumbnails behind it.
+    thumb_sem: tokio::sync::Semaphore,
     /// Serializes the (expensive) library fetch so a burst of cold-cache
     /// requests can't fire N concurrent full-library refetches at museum.
     library_fetch_lock: tokio::sync::Mutex<()>,
@@ -179,11 +183,13 @@ async fn main() {
     let settings = Settings::from_env();
     let addr = format!("{}:{}", settings.host, settings.port);
     let store = SessionStore::new(settings.session_ttl);
-    let download_sem = tokio::sync::Semaphore::new(settings.max_concurrent_downloads);
+    let download_sem = Arc::new(tokio::sync::Semaphore::new(settings.max_concurrent_downloads));
+    let thumb_sem = tokio::sync::Semaphore::new(settings.max_concurrent_thumbnails);
     let state = Arc::new(AppState {
         settings,
         store,
         download_sem,
+        thumb_sem,
         library_fetch_lock: tokio::sync::Mutex::new(()),
     });
 
@@ -840,16 +846,26 @@ async fn get_image(
 
     // Backpressure: cap concurrent download+decrypt work. Excess requests wait
     // here rather than piling up unbounded heavy operations on the runtime.
-    let _permit = state
+    let permit = state
         .download_sem
-        .acquire()
+        .clone()
+        .acquire_owned()
         .await
         .map_err(|e| AppError(StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
 
-    let data = files::download_image(&client, &state.settings, &file).await?;
-    let media_type = sniff_media_type(&data);
+    let (head, body) = files::download_image_stream(&client, &state.settings, &file).await?;
+    let media_type = sniff_media_type(&head);
     let filename = file.title.clone().unwrap_or_else(|| image_id.to_string());
     let encrypted_url = state.settings.download_url(file.id);
+
+    // The permit has to outlive the response body, not just this handler, or the
+    // concurrency cap would stop capping anything the moment we start streaming.
+    let body = async_stream::stream! {
+        let _permit = permit;
+        for await chunk in body {
+            yield chunk;
+        }
+    };
 
     let response = Response::builder()
         .status(StatusCode::OK)
@@ -861,7 +877,7 @@ async fn get_image(
         // Where the still-encrypted blob lives (e.g. the S3 bucket), so other
         // apps can fetch it directly instead of via this decrypting endpoint.
         .header("X-Encrypted-Download-Url", encrypted_url)
-        .body(Body::from(data))
+        .body(Body::from_stream(body))
         .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(response)
 }
@@ -901,7 +917,7 @@ async fn get_thumbnail(
     };
 
     let _permit = state
-        .download_sem
+        .thumb_sem
         .acquire()
         .await
         .map_err(|e| AppError(StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
